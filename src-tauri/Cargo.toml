@@ -1,6 +1,6 @@
 [package]
 name = "epgsync"
-version = "0.1.0"
+version = "0.0.0"
 description = "EDCB EPG data synchronizer"
 authors = ["AariyJP"]
 edition = "2024"
