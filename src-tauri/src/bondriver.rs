@@ -222,21 +222,22 @@ pub fn apply(cfg: &Config) -> Vec<String> {
     log
 }
 
+fn relay_once(name: &str) -> Result<std::process::ExitStatus, String> {
+    let cfg = sync::load()?;
+    let peer = relays(&cfg).find(|p| p.bdp_name.trim() == name).ok_or(format!("{name}: not configured"))?;
+    let (id, secret) = sync::read_token(&peer.token_file).map_err(|e| format!("{name}: {}: {e}", peer.token_file))?;
+    Command::new(&cfg.cloudflared)
+        .args(["access", "tcp", "--hostname", peer.bdp_url.trim(), "--url", &format!("127.0.0.1:{}", peer.bdp_port), "--loglevel", "warn"])
+        .env("TUNNEL_SERVICE_TOKEN_ID", id)
+        .env("TUNNEL_SERVICE_TOKEN_SECRET", secret)
+        .status()
+        .map_err(|e| format!("{name}: {}: {e}", cfg.cloudflared))
+}
+
 pub fn relay(name: &str) -> Result<(), String> {
     loop {
-        let found = sync::load().and_then(|cfg| {
-            let peer = relays(&cfg).find(|p| p.bdp_name.trim() == name).cloned().ok_or(format!("{name}: not configured"))?;
-            Ok((cfg, peer))
-        });
-        match found.and_then(|(cfg, peer)| Ok((sync::read_token(&peer.token_file).map_err(|e| format!("{name}: {}: {e}", peer.token_file))?, cfg, peer))) {
-            Ok(((id, secret), cfg, peer)) => {
-                let status = Command::new(&cfg.cloudflared)
-                    .args(["access", "tcp", "--hostname", peer.bdp_url.trim(), "--url", &format!("127.0.0.1:{}", peer.bdp_port), "--loglevel", "warn"])
-                    .env("TUNNEL_SERVICE_TOKEN_ID", id)
-                    .env("TUNNEL_SERVICE_TOKEN_SECRET", secret)
-                    .status();
-                eprintln!("{name}: cloudflared exited: {status:?}");
-            }
+        match relay_once(name) {
+            Ok(status) => eprintln!("{name}: cloudflared exited: {status}"),
             Err(e) => eprintln!("{e}"),
         }
         std::thread::sleep(Duration::from_secs(10));

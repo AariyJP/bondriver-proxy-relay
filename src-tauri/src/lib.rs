@@ -19,8 +19,9 @@ fn config_path() -> String {
 }
 
 #[tauri::command]
-fn list_own(cfg: Config) -> Result<Vec<String>, String> {
-    Ok(sync::list_own(&cfg)?.into_iter().map(|(n, _, _)| n).collect())
+async fn list_own(cfg: Config) -> Result<Vec<String>, String> {
+    let rows = tauri::async_runtime::spawn_blocking(move || sync::list_own(&cfg)).await.map_err(|e| e.to_string())??;
+    Ok(rows.into_iter().map(|(n, _, _)| n).collect())
 }
 
 #[tauri::command]

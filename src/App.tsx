@@ -30,6 +30,12 @@ function Field({ id, label, value, onChange, placeholder }: { id: string; label:
   );
 }
 
+function LogView({ lines }: { lines?: string[] }) {
+  return lines?.length ? <pre className="rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">{lines.join("\n")}</pre> : null;
+}
+
+type Cmd = "run_pull" | "apply_bondriver";
+
 type Theme = "light" | "dark" | "system";
 
 function ThemeToggle() {
@@ -66,11 +72,9 @@ export default function App() {
   const [ownText, setOwnText] = useState("");
   const [path, setPath] = useState("");
   const [ownFiles, setOwnFiles] = useState<string[] | null>(null);
-  const [log, setLog] = useState<string[]>([]);
   const [status, setStatus] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [applyLog, setApplyLog] = useState<string[]>([]);
-  const [applying, setApplying] = useState(false);
+  const [running, setRunning] = useState<Partial<Record<Cmd, boolean>>>({});
+  const [logs, setLogs] = useState<Partial<Record<Cmd, string[]>>>({});
 
   useEffect(() => {
     invoke<string>("config_path").then(setPath);
@@ -106,30 +110,18 @@ export default function App() {
     }
   };
 
-  const pull = async () => {
-    setBusy(true);
-    setLog([]);
+  const run = async (cmd: Cmd) => {
+    setRunning((r) => ({ ...r, [cmd]: true }));
+    setLogs((l) => ({ ...l, [cmd]: [] }));
+    let out: string[];
     try {
       await invoke("save_config", { cfg: current() });
-      setLog(await invoke<string[]>("run_pull"));
+      out = await invoke<string[]>(cmd);
     } catch (e) {
-      setLog([String(e)]);
-    } finally {
-      setBusy(false);
+      out = [String(e)];
     }
-  };
-
-  const apply = async () => {
-    setApplying(true);
-    setApplyLog([]);
-    try {
-      await invoke("save_config", { cfg: current() });
-      setApplyLog(await invoke<string[]>("apply_bondriver"));
-    } catch (e) {
-      setApplyLog([String(e)]);
-    } finally {
-      setApplying(false);
-    }
+    setLogs((l) => ({ ...l, [cmd]: out }));
+    setRunning((r) => ({ ...r, [cmd]: false }));
   };
 
   return (
@@ -226,11 +218,11 @@ export default function App() {
           <CardDescription>チューナー欄がある取得先ごとに BonDriver_Proxy_名前 を作り、cloudflared の中継を常駐登録します (管理者権限)。</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3">
-          <Button className="w-fit" disabled={applying} onClick={apply}>
+          <Button className="w-fit" disabled={running.apply_bondriver} onClick={() => run("apply_bondriver")}>
             <Cable />
-            {applying ? "適用中…" : "BonDriver を適用"}
+            {running.apply_bondriver ? "適用中…" : "BonDriver を適用"}
           </Button>
-          {applyLog.length > 0 && <pre className="rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">{applyLog.join("\n")}</pre>}
+          <LogView lines={logs.apply_bondriver} />
         </CardContent>
       </Card>
 
@@ -240,11 +232,11 @@ export default function App() {
           <CardDescription>設定を保存してから pull を 1 回実行します。</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3">
-          <Button className="w-fit" disabled={busy} onClick={pull}>
+          <Button className="w-fit" disabled={running.run_pull} onClick={() => run("run_pull")}>
             <Download />
-            {busy ? "取得中…" : "pull を実行"}
+            {running.run_pull ? "取得中…" : "pull を実行"}
           </Button>
-          {log.length > 0 && <pre className="rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">{log.join("\n")}</pre>}
+          <LogView lines={logs.run_pull} />
         </CardContent>
       </Card>
     </main>

@@ -98,13 +98,17 @@ fn is_name(n: &str) -> bool {
 }
 
 pub fn is_own(cfg: &Config, n: &str) -> bool {
-    let upper = n.to_ascii_uppercase();
-    let hit = cfg.own.iter().map(|p| p.trim().to_ascii_uppercase()).any(|p| !p.is_empty() && upper.starts_with(&p));
-    is_name(n) && hit != cfg.own_invert
+    if !is_name(n) {
+        return false;
+    }
+    let hit = cfg.own.iter().map(|p| p.trim().as_bytes()).any(|p| !p.is_empty() && n.len() >= p.len() && n.as_bytes()[..p.len()].eq_ignore_ascii_case(p));
+    hit != cfg.own_invert
 }
 
 fn meta_secs(meta: &fs::Metadata) -> Option<u64> {
-    meta.is_file().then_some(())?;
+    if !meta.is_file() {
+        return None;
+    }
     Some(meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs())
 }
 
@@ -120,9 +124,9 @@ pub fn list_own(cfg: &Config) -> Result<Vec<(String, u64, u64)>, String> {
         if !is_own(cfg, &name) {
             continue;
         }
-        if let Some((m, len)) = fs::metadata(entry.path()).ok().and_then(|meta| Some((meta_secs(&meta)?, meta.len()))) {
-            rows.push((name, len, m));
-        }
+        let Ok(meta) = fs::metadata(entry.path()) else { continue };
+        let Some(m) = meta_secs(&meta) else { continue };
+        rows.push((name, meta.len(), m));
     }
     rows.sort();
     Ok(rows)
@@ -139,30 +143,35 @@ pub fn serve() -> Result<(), String> {
 
 fn handle(req: tiny_http::Request) {
     let path = req.url().split('?').next().unwrap_or("").to_string();
-    let (code, body, ctype) = match load() {
+    let resp = match load() {
         Err(e) => {
             eprintln!("{e}");
-            (503, b"config error\n".to_vec(), "text/plain")
+            text(503, "config error\n".into())
         }
-        Ok(cfg) => match respond(&cfg, &path) {
-            Some((body, ctype)) => (200, body, ctype),
-            None => (404, b"not found\n".to_vec(), "text/plain"),
-        },
+        Ok(cfg) => respond(&cfg, &path).unwrap_or_else(|| text(404, "not found\n".into())),
     };
-    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap();
-    let _ = req.respond(tiny_http::Response::from_data(body).with_status_code(code).with_header(header));
+    let _ = req.respond(resp);
 }
 
-fn respond(cfg: &Config, path: &str) -> Option<(Vec<u8>, &'static str)> {
+fn content_type(v: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(&b"Content-Type"[..], v.as_bytes()).unwrap()
+}
+
+fn text(code: u16, body: String) -> tiny_http::ResponseBox {
+    tiny_http::Response::from_data(body.into_bytes()).with_status_code(code).with_header(content_type("text/plain")).boxed()
+}
+
+fn respond(cfg: &Config, path: &str) -> Option<tiny_http::ResponseBox> {
     if path == "/epg" || path == "/epg/" {
         let rows: Vec<String> = list_own(cfg).ok()?.into_iter().map(|(n, s, m)| format!("{n}\t{s}\t{m}")).collect();
-        return Some(((rows.join("\n") + "\n").into_bytes(), "text/plain"));
+        return Some(text(200, rows.join("\n") + "\n"));
     }
     let name = path.strip_prefix("/epg/")?;
     if !is_own(cfg, name) {
         return None;
     }
-    fs::read(Path::new(&cfg.epg_dir).join(name)).ok().map(|d| (d, "application/octet-stream"))
+    let data = fs::read(Path::new(&cfg.epg_dir).join(name)).ok()?;
+    Some(tiny_http::Response::from_data(data).with_header(content_type("application/octet-stream")).boxed())
 }
 
 pub(crate) fn read_token(path: &str) -> Result<(String, String), String> {
@@ -188,14 +197,17 @@ pub(crate) fn read_token(path: &str) -> Result<(String, String), String> {
 
 pub fn reload_epg(addr: &str) -> Result<i32, String> {
     let sa = addr.to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("invalid address")?;
-    let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(30)).map_err(|e| e.to_string())?;
-    s.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
-    let mut req = [0u8; 8];
-    req[..4].copy_from_slice(&2i32.to_le_bytes());
-    s.write_all(&req).map_err(|e| e.to_string())?;
-    let mut res = [0u8; 4];
-    s.read_exact(&mut res).map_err(|e| e.to_string())?;
-    Ok(i32::from_le_bytes(res))
+    (|| -> std::io::Result<i32> {
+        let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(30))?;
+        s.set_read_timeout(Some(Duration::from_secs(30)))?;
+        let mut req = [0u8; 8];
+        req[..4].copy_from_slice(&2i32.to_le_bytes());
+        s.write_all(&req)?;
+        let mut res = [0u8; 4];
+        s.read_exact(&mut res)?;
+        Ok(i32::from_le_bytes(res))
+    })()
+    .map_err(|e| e.to_string())
 }
 
 fn pull_peer(cfg: &Config, agent: &ureq::Agent, peer: &Peer, changed: &mut Vec<String>, log: &mut Vec<String>) -> Result<(), String> {
@@ -214,12 +226,11 @@ fn pull_peer(cfg: &Config, agent: &ureq::Agent, peer: &Peer, changed: &mut Vec<S
     };
     let list = String::from_utf8_lossy(&get(&base)?).into_owned();
     for line in list.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() != 3 || !is_name(parts[0]) || is_own(cfg, parts[0]) {
+        let [name, size, mtime] = line.split('\t').collect::<Vec<_>>()[..] else { continue };
+        if !is_name(name) || is_own(cfg, name) {
             continue;
         }
-        let (Ok(size), Ok(mtime)) = (parts[1].parse::<u64>(), parts[2].parse::<u64>()) else { continue };
-        let name = parts[0];
+        let (Ok(size), Ok(mtime)) = (size.parse::<u64>(), mtime.parse::<u64>()) else { continue };
         let dst = Path::new(&cfg.epg_dir).join(name);
         if mtime_secs(&dst).is_some_and(|m| m >= mtime) {
             continue;
