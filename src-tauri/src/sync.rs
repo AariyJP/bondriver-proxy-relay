@@ -86,7 +86,8 @@ pub fn save(cfg: &Config) -> Result<(), String> {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, &path)).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn is_name(n: &str) -> bool {
@@ -102,9 +103,13 @@ pub fn is_own(cfg: &Config, n: &str) -> bool {
     is_name(n) && hit != cfg.own_invert
 }
 
-fn mtime_secs(path: &Path) -> Option<u64> {
-    let meta = fs::metadata(path).ok().filter(|m| m.is_file())?;
+fn meta_secs(meta: &fs::Metadata) -> Option<u64> {
+    meta.is_file().then_some(())?;
     Some(meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs())
+}
+
+fn mtime_secs(path: &Path) -> Option<u64> {
+    meta_secs(&fs::metadata(path).ok()?)
 }
 
 pub fn list_own(cfg: &Config) -> Result<Vec<(String, u64, u64)>, String> {
@@ -115,9 +120,8 @@ pub fn list_own(cfg: &Config) -> Result<Vec<(String, u64, u64)>, String> {
         if !is_own(cfg, &name) {
             continue;
         }
-        let path = entry.path();
-        if let (Some(m), Ok(meta)) = (mtime_secs(&path), fs::metadata(&path)) {
-            rows.push((name, meta.len(), m));
+        if let Some((m, len)) = fs::metadata(entry.path()).ok().and_then(|meta| Some((meta_secs(&meta)?, meta.len()))) {
+            rows.push((name, len, m));
         }
     }
     rows.sort();
@@ -135,9 +139,15 @@ pub fn serve() -> Result<(), String> {
 
 fn handle(req: tiny_http::Request) {
     let path = req.url().split('?').next().unwrap_or("").to_string();
-    let (code, body, ctype) = match load().ok().and_then(|cfg| respond(&cfg, &path)) {
-        Some((body, ctype)) => (200, body, ctype),
-        None => (404, b"not found\n".to_vec(), "text/plain"),
+    let (code, body, ctype) = match load() {
+        Err(e) => {
+            eprintln!("{e}");
+            (503, b"config error\n".to_vec(), "text/plain")
+        }
+        Ok(cfg) => match respond(&cfg, &path) {
+            Some((body, ctype)) => (200, body, ctype),
+            None => (404, b"not found\n".to_vec(), "text/plain"),
+        },
     };
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap();
     let _ = req.respond(tiny_http::Response::from_data(body).with_status_code(code).with_header(header));
@@ -221,19 +231,24 @@ fn pull_peer(cfg: &Config, agent: &ureq::Agent, peer: &Peer, changed: &mut Vec<S
         }
         let tmp = dst.with_file_name(format!("{name}.sync"));
         let t = UNIX_EPOCH + Duration::from_secs(mtime);
-        let io = |e: std::io::Error| format!("{name}: {e}");
-        let mut f = File::create(&tmp).map_err(io)?;
-        f.write_all(&data).map_err(io)?;
-        f.set_times(FileTimes::new().set_accessed(t).set_modified(t)).map_err(io)?;
-        drop(f);
-        fs::rename(&tmp, &dst).map_err(io)?;
+        let written = (|| -> std::io::Result<()> {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&data)?;
+            f.set_times(FileTimes::new().set_accessed(t).set_modified(t))?;
+            drop(f);
+            fs::rename(&tmp, &dst)
+        })();
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("{name}: {e}"));
+        }
         changed.push(name.to_string());
     }
     Ok(())
 }
 
 pub fn pull(cfg: &Config) -> Vec<String> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(120)).user_agent(USER_AGENT).build();
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(30)).timeout_read(Duration::from_secs(120)).user_agent(USER_AGENT).build();
     let (mut log, mut changed) = (Vec::new(), Vec::new());
     for peer in &cfg.peers {
         if !Path::new(&peer.token_file).is_file() {

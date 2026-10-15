@@ -183,24 +183,34 @@ fn unregister(name: &str) -> Result<(), String> {
 
 pub fn apply(cfg: &Config) -> Vec<String> {
     let mut log = Vec::new();
-    let mut names = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut ports = Vec::new();
+    let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
     for peer in relays(cfg) {
         let name = peer.bdp_name.trim();
         if !valid_name(name) || peer.bdp_port == 0 || peer.bdp_group.trim().is_empty() {
             log.push(format!("{}: BonDriver の名前・ポート・グループ名を確認してください", peer.bdp_url));
             continue;
         }
+        if names.iter().any(|n| n.eq_ignore_ascii_case(name)) || ports.contains(&peer.bdp_port) {
+            log.push(format!("{name}: 名前かポート ({}) がほかの取得先と重複しています", peer.bdp_port));
+            continue;
+        }
         names.push(name.to_string());
+        ports.push(peer.bdp_port);
         match write_module(cfg, peer) {
             Ok(m) => log.push(format!("{name}: {m}")),
-            Err(e) => log.push(format!("{name}: {e}")),
+            Err(e) => {
+                log.push(format!("{name}: {e}"));
+                continue;
+            }
         }
         match register(name) {
             Ok(()) => log.push(format!("{name}: 中継を登録しました (127.0.0.1:{} → {})", peer.bdp_port, peer.bdp_url)),
             Err(e) => log.push(format!("{name}: 中継の登録に失敗しました: {e}")),
         }
     }
-    for stale in registered().into_iter().filter(|n| !names.contains(n)) {
+    for stale in registered().into_iter().filter(|s| !names.iter().any(|n| same(n, s))) {
         match unregister(&stale) {
             Ok(()) => log.push(format!("{stale}: 中継の登録を外しました")),
             Err(e) => log.push(format!("{stale}: 中継の削除に失敗しました: {e}")),
@@ -214,10 +224,12 @@ pub fn apply(cfg: &Config) -> Vec<String> {
 
 pub fn relay(name: &str) -> Result<(), String> {
     loop {
-        let cfg = sync::load()?;
-        let peer = relays(&cfg).find(|p| p.bdp_name.trim() == name).cloned().ok_or(format!("{name}: not configured"))?;
-        match sync::read_token(&peer.token_file) {
-            Ok((id, secret)) => {
+        let found = sync::load().and_then(|cfg| {
+            let peer = relays(&cfg).find(|p| p.bdp_name.trim() == name).cloned().ok_or(format!("{name}: not configured"))?;
+            Ok((cfg, peer))
+        });
+        match found.and_then(|(cfg, peer)| Ok((sync::read_token(&peer.token_file).map_err(|e| format!("{name}: {}: {e}", peer.token_file))?, cfg, peer))) {
+            Ok(((id, secret), cfg, peer)) => {
                 let status = Command::new(&cfg.cloudflared)
                     .args(["access", "tcp", "--hostname", peer.bdp_url.trim(), "--url", &format!("127.0.0.1:{}", peer.bdp_port), "--loglevel", "warn"])
                     .env("TUNNEL_SERVICE_TOKEN_ID", id)
@@ -225,14 +237,18 @@ pub fn relay(name: &str) -> Result<(), String> {
                     .status();
                 eprintln!("{name}: cloudflared exited: {status:?}");
             }
-            Err(e) => eprintln!("{name}: {}: {e}", peer.token_file),
+            Err(e) => eprintln!("{e}"),
         }
         std::thread::sleep(Duration::from_secs(10));
     }
 }
 
+fn apply_log() -> PathBuf {
+    sync::config_path().with_file_name("apply.log")
+}
+
 pub fn apply_elevated() -> Result<Vec<String>, String> {
-    let log = sync::config_path().with_file_name("apply.log");
+    let log = apply_log();
     let _ = fs::remove_file(&log);
     let exe = exe()?;
     let config = sync::config_path().display().to_string();
@@ -255,7 +271,7 @@ pub fn apply_elevated() -> Result<Vec<String>, String> {
 
 pub fn apply_cli() -> Result<(), String> {
     let lines = apply(&sync::load()?);
-    let _ = fs::write(sync::config_path().with_file_name("apply.log"), lines.join("\n"));
+    let _ = fs::write(apply_log(), lines.join("\n"));
     lines.iter().for_each(|l| println!("{l}"));
     Ok(())
 }
