@@ -17,8 +17,16 @@ fn relays(cfg: &Config) -> impl Iterator<Item = &Peer> {
     cfg.peers.iter().filter(|p| !p.bdp_url.trim().is_empty())
 }
 
+fn module_file(name: &str) -> String {
+    format!("BonDriver_Proxy_{name}.{EXT}")
+}
+
 fn module_path(cfg: &Config, name: &str) -> PathBuf {
-    Path::new(&cfg.bondriver_dir).join(format!("BonDriver_Proxy_{name}.{EXT}"))
+    Path::new(&cfg.bondriver_dir).join(module_file(name))
+}
+
+fn utf16le(s: &str) -> Vec<u8> {
+    std::iter::once(0xFEFFu16).chain(s.encode_utf16()).flat_map(u16::to_le_bytes).collect()
 }
 
 fn setting_path(module: &Path) -> PathBuf {
@@ -93,7 +101,7 @@ fn edcb_ini(cfg: &Config) -> PathBuf {
 }
 
 fn num(v: &[u8]) -> Option<i64> {
-    String::from_utf8_lossy(v).trim().parse().ok()
+    std::str::from_utf8(v).ok()?.trim().parse().ok()
 }
 
 fn section_range(lines: &[Vec<u8>], head: &[u8]) -> Option<(usize, usize)> {
@@ -118,21 +126,21 @@ fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, on: bool) -> bool {
             for line in lines.iter().map(|l| l.trim_ascii()) {
                 if line.starts_with(b"[") {
                     bondriver = line.len() > 10 && line[1..10].eq_ignore_ascii_case(b"BonDriver");
-                } else if let (true, Some(v)) = (bondriver, line.strip_prefix(b"Priority=")) {
+                } else if bondriver && let Some(v) = line.strip_prefix(b"Priority=") {
                     priority = priority.max(num(v).unwrap_or(-1));
                 }
             }
-            let entry = format!("\n{section}\nCount=1\nGetEpg=0\nEPGCount=0\nPriority={}", priority + 1);
-            lines.extend(entry.split('\n').map(|s| s.as_bytes().to_vec()));
+            let entry = [String::new(), section, "Count=1".into(), "GetEpg=0".into(), "EPGCount=0".into(), format!("Priority={}", priority + 1)];
+            lines.extend(entry.map(String::into_bytes));
             changed = true;
         }
         Some((s, e)) => {
-            let at = (s..e).find(|&i| lines[i].trim_ascii().starts_with(b"Count="));
-            let count = at.and_then(|i| num(&lines[i].trim_ascii()[6..])).unwrap_or(0);
+            let at = (s..e).find_map(|i| lines[i].trim_ascii().strip_prefix(b"Count=").map(|v| (i, num(v))));
+            let count = at.and_then(|(_, n)| n).unwrap_or(0);
             if (count > 0) != on {
                 let entry = format!("Count={}", on as u8).into_bytes();
                 match at {
-                    Some(i) => lines[i] = entry,
+                    Some((i, _)) => lines[i] = entry,
                     None => lines.insert(s, entry),
                 }
                 changed = true;
@@ -148,17 +156,19 @@ fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, on: bool) -> bool {
         r => r,
     };
     if let Some((s, e)) = viewer {
-        let mut values: Vec<(i64, Vec<u8>)> = lines[s..e].iter().filter_map(|l| indexed(l).map(|(k, v)| (k, v.to_vec()))).collect();
-        values.sort_by_key(|v| v.0);
-        let listed = values.iter().any(|(_, v)| v.eq_ignore_ascii_case(file.as_bytes()));
+        let mut keyed: Vec<(i64, &[u8])> = lines[s..e].iter().filter_map(|l| indexed(l)).collect();
+        keyed.sort_by_key(|v| v.0);
+        let mut values: Vec<Vec<u8>> = keyed.into_iter().map(|(_, v)| v.to_vec()).collect();
+        let listed = values.iter().any(|v| v.eq_ignore_ascii_case(file.as_bytes()));
         if listed != on {
-            values.retain(|(_, v)| !v.eq_ignore_ascii_case(file.as_bytes()));
             if on {
-                values.push((0, file.as_bytes().to_vec()));
+                values.push(file.as_bytes().to_vec());
+            } else {
+                values.retain(|v| !v.eq_ignore_ascii_case(file.as_bytes()));
             }
             let rest: Vec<Vec<u8>> = lines.drain(s..e).filter(|l| !l.trim_ascii().starts_with(b"Num=") && indexed(l).is_none()).collect();
             let mut body = vec![format!("Num={}", values.len()).into_bytes()];
-            body.extend(values.into_iter().enumerate().map(|(i, (_, v))| [format!("{i}=").into_bytes(), v].concat()));
+            body.extend(values.into_iter().enumerate().map(|(i, v)| [format!("{i}=").into_bytes(), v].concat()));
             body.extend(rest);
             lines.splice(s..s, body);
             changed = true;
@@ -180,21 +190,15 @@ fn update_tuners(cfg: &Config, changes: &[(String, bool)]) -> Result<Vec<(String
         raw
     };
     let mut lines = split_lines(&text);
-    let done: Vec<(String, bool)> = changes
-        .iter()
-        .filter(|(name, on)| {
-            let file = module_path(cfg, name).file_name().unwrap_or_default().to_string_lossy().into_owned();
-            set_tuner(&mut lines, &file, *on)
-        })
-        .cloned()
-        .collect();
-    if !done.is_empty() {
-        let mut out = join_lines(&lines);
-        if utf16 {
-            out = [0xFF, 0xFE].into_iter().chain(String::from_utf8_lossy(&out).encode_utf16().flat_map(u16::to_le_bytes)).collect();
+    let mut done = Vec::new();
+    for (name, on) in changes {
+        if set_tuner(&mut lines, &module_file(name), *on) {
+            done.push((name.clone(), *on));
         }
-        let tmp = ini.with_extension("ini.tmp");
-        fs::write(&tmp, out).and_then(|_| fs::rename(&tmp, &ini)).map_err(|e| format!("{}: {e}", ini.display()))?;
+    }
+    if !done.is_empty() {
+        let out = join_lines(&lines);
+        sync::write_atomic(&ini, if utf16 { utf16le(&String::from_utf8_lossy(&out)) } else { out })?;
     }
     Ok(done)
 }
@@ -238,8 +242,7 @@ fn register(name: &str) -> Result<(), String> {
         esc(&args)
     );
     let file = std::env::temp_dir().join(format!("epgsync-relay-{name}.xml"));
-    let bytes: Vec<u8> = std::iter::once(0xFEFFu16).chain(xml.encode_utf16()).flat_map(u16::to_le_bytes).collect();
-    fs::write(&file, bytes).map_err(|e| e.to_string())?;
+    fs::write(&file, utf16le(&xml)).map_err(|e| e.to_string())?;
     let task = format!("{TASK_PREFIX}{name}");
     let result = run("schtasks", &["/Create", "/TN", &task, "/XML", &file.display().to_string(), "/F"]);
     let _ = fs::remove_file(&file);
