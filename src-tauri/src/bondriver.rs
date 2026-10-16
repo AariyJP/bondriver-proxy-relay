@@ -75,6 +75,33 @@ fn write_module(cfg: &Config, peer: &Peer) -> Result<String, String> {
     Ok(format!("{} / {}", module.display(), setting.display()))
 }
 
+fn register_tuner(cfg: &Config, name: &str) -> Result<bool, String> {
+    let module = module_path(cfg, name);
+    let section = format!("[{}]", module.file_name().unwrap_or_default().to_string_lossy());
+    let ini = Path::new(&cfg.epg_dir).parent().and_then(Path::parent).unwrap_or(Path::new("")).join("EpgTimerSrv.ini");
+    let mut text = fs::read(&ini).map_err(|e| format!("{}: {e}", ini.display()))?;
+    let mut bondriver = false;
+    let mut priority = -1i64;
+    for line in text.split(|&b| b == b'\n').map(|l| l.trim_ascii()) {
+        if line.eq_ignore_ascii_case(section.as_bytes()) {
+            return Ok(false);
+        }
+        if line.starts_with(b"[") {
+            bondriver = line.len() > 10 && line[1..10].eq_ignore_ascii_case(b"BonDriver");
+        } else if let (true, Some(v)) = (bondriver, line.strip_prefix(b"Priority=")) {
+            priority = priority.max(String::from_utf8_lossy(v).parse().unwrap_or(-1));
+        }
+    }
+    let eol = if cfg!(windows) { "\r\n" } else { "\n" };
+    if !text.is_empty() && !text.ends_with(b"\n") {
+        text.extend_from_slice(eol.as_bytes());
+    }
+    let entry = format!("{eol}{section}{eol}Count=1{eol}GetEpg=0{eol}EPGCount=0{eol}Priority={}{eol}", priority + 1);
+    text.extend_from_slice(entry.as_bytes());
+    fs::write(&ini, text).map_err(|e| format!("{}: {e}", ini.display()))?;
+    Ok(true)
+}
+
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
     let out = Command::new(cmd).args(args).output().map_err(|e| format!("{cmd}: {e}"))?;
     if out.status.success() {
@@ -204,6 +231,11 @@ pub fn apply(cfg: &Config) -> Vec<String> {
                 log.push(format!("{name}: {e}"));
                 continue;
             }
+        }
+        match register_tuner(cfg, name) {
+            Ok(true) => log.push(format!("{name}: EpgTimerSrv.ini にチューナーとして登録しました (EpgTimer Service の再起動後に反映されます)")),
+            Ok(false) => {}
+            Err(e) => log.push(format!("{name}: EpgTimerSrv.ini への登録に失敗しました: {e}")),
         }
         match register(name) {
             Ok(()) => log.push(format!("{name}: 中継を登録しました (127.0.0.1:{} → {})", peer.bdp_port, peer.bdp_url)),
