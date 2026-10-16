@@ -79,27 +79,55 @@ fn register_tuner(cfg: &Config, name: &str) -> Result<bool, String> {
     let module = module_path(cfg, name);
     let section = format!("[{}]", module.file_name().unwrap_or_default().to_string_lossy());
     let ini = Path::new(&cfg.epg_dir).parent().and_then(Path::parent).unwrap_or(Path::new("")).join("EpgTimerSrv.ini");
-    let mut text = fs::read(&ini).map_err(|e| format!("{}: {e}", ini.display()))?;
-    let mut bondriver = false;
-    let mut priority = -1i64;
-    for line in text.split(|&b| b == b'\n').map(|l| l.trim_ascii()) {
-        if line.eq_ignore_ascii_case(section.as_bytes()) {
-            return Ok(false);
+    let text = fs::read(&ini).map_err(|e| format!("{}: {e}", ini.display()))?;
+    let mut lines: Vec<Vec<u8>> = text.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec()).collect();
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let num = |v: &[u8]| String::from_utf8_lossy(v).trim().parse::<i64>().ok();
+    let file = &section[1..section.len() - 1];
+    let mut changed = false;
+    if !lines.iter().any(|l| l.trim_ascii().eq_ignore_ascii_case(section.as_bytes())) {
+        let mut bondriver = false;
+        let mut priority = -1;
+        for line in lines.iter().map(|l| l.trim_ascii()) {
+            if line.starts_with(b"[") {
+                bondriver = line.len() > 10 && line[1..10].eq_ignore_ascii_case(b"BonDriver");
+            } else if let (true, Some(v)) = (bondriver, line.strip_prefix(b"Priority=")) {
+                priority = priority.max(num(v).unwrap_or(-1));
+            }
         }
-        if line.starts_with(b"[") {
-            bondriver = line.len() > 10 && line[1..10].eq_ignore_ascii_case(b"BonDriver");
-        } else if let (true, Some(v)) = (bondriver, line.strip_prefix(b"Priority=")) {
-            priority = priority.max(String::from_utf8_lossy(v).parse().unwrap_or(-1));
+        let entry = format!("\n{section}\nCount=1\nGetEpg=0\nEPGCount=0\nPriority={}", priority + 1);
+        lines.extend(entry.split('\n').map(|s| s.as_bytes().to_vec()));
+        changed = true;
+    }
+    match lines.iter().position(|l| l.trim_ascii().eq_ignore_ascii_case(b"[TVTEST]")) {
+        None => {
+            lines.extend(["[TVTEST]".into(), "Num=1".into(), format!("0={file}")].map(String::into_bytes));
+            changed = true;
+        }
+        Some(start) => {
+            let end = lines[start + 1..].iter().position(|l| l.trim_ascii().starts_with(b"[")).map_or(lines.len(), |i| start + 1 + i);
+            let listed = lines[start + 1..end].iter().any(|l| l.split(|&b| b == b'=').nth(1).is_some_and(|v| v.trim_ascii().eq_ignore_ascii_case(file.as_bytes())));
+            if !listed {
+                let at = lines[start + 1..end].iter().position(|l| l.trim_ascii().starts_with(b"Num="));
+                let n = at.and_then(|i| num(&lines[start + 1 + i].trim_ascii()[4..])).unwrap_or(0);
+                lines.insert(end, format!("{n}={file}").into_bytes());
+                match at {
+                    Some(i) => lines[start + 1 + i] = format!("Num={}", n + 1).into_bytes(),
+                    None => lines.insert(start + 1, b"Num=1".to_vec()),
+                }
+                changed = true;
+            }
         }
     }
-    let eol = if cfg!(windows) { "\r\n" } else { "\n" };
-    if !text.is_empty() && !text.ends_with(b"\n") {
-        text.extend_from_slice(eol.as_bytes());
+    if changed {
+        let eol: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\n" };
+        let mut out = lines.join(eol);
+        out.extend_from_slice(eol);
+        fs::write(&ini, out).map_err(|e| format!("{}: {e}", ini.display()))?;
     }
-    let entry = format!("{eol}{section}{eol}Count=1{eol}GetEpg=0{eol}EPGCount=0{eol}Priority={}{eol}", priority + 1);
-    text.extend_from_slice(entry.as_bytes());
-    fs::write(&ini, text).map_err(|e| format!("{}: {e}", ini.display()))?;
-    Ok(true)
+    Ok(changed)
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -233,7 +261,7 @@ pub fn apply(cfg: &Config) -> Vec<String> {
             }
         }
         match register_tuner(cfg, name) {
-            Ok(true) => log.push(format!("{name}: EpgTimerSrv.ini にチューナーとして登録しました (EpgTimer Service の再起動後に反映されます)")),
+            Ok(true) => log.push(format!("{name}: EpgTimerSrv.ini にチューナー・視聴用として登録しました (EpgTimer Service の再起動後に反映されます)")),
             Ok(false) => {}
             Err(e) => log.push(format!("{name}: EpgTimerSrv.ini への登録に失敗しました: {e}")),
         }
