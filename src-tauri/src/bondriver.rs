@@ -29,11 +29,23 @@ fn setting_path(module: &Path) -> PathBuf {
     }
 }
 
-fn set_keys(text: &[u8], keys: &[(&str, String)]) -> Vec<u8> {
+fn split_lines(text: &[u8]) -> Vec<Vec<u8>> {
     let mut lines: Vec<Vec<u8>> = text.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec()).collect();
     if lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
+    lines
+}
+
+fn join_lines(lines: &[Vec<u8>]) -> Vec<u8> {
+    let eol: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\n" };
+    let mut out = lines.join(eol);
+    out.extend_from_slice(eol);
+    out
+}
+
+fn set_keys(text: &[u8], keys: &[(&str, String)]) -> Vec<u8> {
+    let mut lines = split_lines(text);
     for (key, value) in keys {
         let entry = format!("{key}={value}").into_bytes();
         let prefix = format!("{key}=").into_bytes();
@@ -45,10 +57,7 @@ fn set_keys(text: &[u8], keys: &[(&str, String)]) -> Vec<u8> {
             lines.push(entry);
         }
     }
-    let eol: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\n" };
-    let mut out = lines.join(eol);
-    out.extend_from_slice(eol);
-    out
+    join_lines(&lines)
 }
 
 fn write_module(cfg: &Config, peer: &Peer) -> Result<String, String> {
@@ -75,59 +84,119 @@ fn write_module(cfg: &Config, peer: &Peer) -> Result<String, String> {
     Ok(format!("{} / {}", module.display(), setting.display()))
 }
 
-fn register_tuner(cfg: &Config, name: &str) -> Result<bool, String> {
-    let module = module_path(cfg, name);
-    let section = format!("[{}]", module.file_name().unwrap_or_default().to_string_lossy());
-    let ini = Path::new(&cfg.epg_dir).parent().and_then(Path::parent).unwrap_or(Path::new("")).join("EpgTimerSrv.ini");
-    let text = fs::read(&ini).map_err(|e| format!("{}: {e}", ini.display()))?;
-    let mut lines: Vec<Vec<u8>> = text.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec()).collect();
-    if lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
+fn edcb_ini(cfg: &Config) -> PathBuf {
+    if cfg!(windows) {
+        Path::new(&cfg.bondriver_dir).parent().unwrap_or(Path::new("")).join("EpgTimerSrv.ini")
+    } else {
+        PathBuf::from("/var/local/edcb/EpgTimerSrv.ini")
     }
-    let num = |v: &[u8]| String::from_utf8_lossy(v).trim().parse::<i64>().ok();
-    let file = &section[1..section.len() - 1];
+}
+
+fn num(v: &[u8]) -> Option<i64> {
+    String::from_utf8_lossy(v).trim().parse().ok()
+}
+
+fn section_range(lines: &[Vec<u8>], head: &[u8]) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|l| l.trim_ascii().eq_ignore_ascii_case(head))? + 1;
+    let end = lines[start..].iter().position(|l| l.trim_ascii().starts_with(b"[")).map_or(lines.len(), |i| start + i);
+    Some((start, end))
+}
+
+fn indexed(line: &[u8]) -> Option<(i64, &[u8])> {
+    let t = line.trim_ascii();
+    let p = t.iter().position(|&b| b == b'=')?;
+    Some((num(&t[..p])?, t[p + 1..].trim_ascii()))
+}
+
+fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, on: bool) -> bool {
+    let section = format!("[{file}]");
     let mut changed = false;
-    if !lines.iter().any(|l| l.trim_ascii().eq_ignore_ascii_case(section.as_bytes())) {
-        let mut bondriver = false;
-        let mut priority = -1;
-        for line in lines.iter().map(|l| l.trim_ascii()) {
-            if line.starts_with(b"[") {
-                bondriver = line.len() > 10 && line[1..10].eq_ignore_ascii_case(b"BonDriver");
-            } else if let (true, Some(v)) = (bondriver, line.strip_prefix(b"Priority=")) {
-                priority = priority.max(num(v).unwrap_or(-1));
+    match section_range(&lines, section.as_bytes()) {
+        None if on => {
+            let mut bondriver = false;
+            let mut priority = -1;
+            for line in lines.iter().map(|l| l.trim_ascii()) {
+                if line.starts_with(b"[") {
+                    bondriver = line.len() > 10 && line[1..10].eq_ignore_ascii_case(b"BonDriver");
+                } else if let (true, Some(v)) = (bondriver, line.strip_prefix(b"Priority=")) {
+                    priority = priority.max(num(v).unwrap_or(-1));
+                }
             }
-        }
-        let entry = format!("\n{section}\nCount=1\nGetEpg=0\nEPGCount=0\nPriority={}", priority + 1);
-        lines.extend(entry.split('\n').map(|s| s.as_bytes().to_vec()));
-        changed = true;
-    }
-    match lines.iter().position(|l| l.trim_ascii().eq_ignore_ascii_case(b"[TVTEST]")) {
-        None => {
-            lines.extend(["[TVTEST]".into(), "Num=1".into(), format!("0={file}")].map(String::into_bytes));
+            let entry = format!("\n{section}\nCount=1\nGetEpg=0\nEPGCount=0\nPriority={}", priority + 1);
+            lines.extend(entry.split('\n').map(|s| s.as_bytes().to_vec()));
             changed = true;
         }
-        Some(start) => {
-            let end = lines[start + 1..].iter().position(|l| l.trim_ascii().starts_with(b"[")).map_or(lines.len(), |i| start + 1 + i);
-            let listed = lines[start + 1..end].iter().any(|l| l.split(|&b| b == b'=').nth(1).is_some_and(|v| v.trim_ascii().eq_ignore_ascii_case(file.as_bytes())));
-            if !listed {
-                let at = lines[start + 1..end].iter().position(|l| l.trim_ascii().starts_with(b"Num="));
-                let n = at.and_then(|i| num(&lines[start + 1 + i].trim_ascii()[4..])).unwrap_or(0);
-                lines.insert(end, format!("{n}={file}").into_bytes());
+        Some((s, e)) => {
+            let at = (s..e).find(|&i| lines[i].trim_ascii().starts_with(b"Count="));
+            let count = at.and_then(|i| num(&lines[i].trim_ascii()[6..])).unwrap_or(0);
+            if (count > 0) != on {
+                let entry = format!("Count={}", on as u8).into_bytes();
                 match at {
-                    Some(i) => lines[start + 1 + i] = format!("Num={}", n + 1).into_bytes(),
-                    None => lines.insert(start + 1, b"Num=1".to_vec()),
+                    Some(i) => lines[i] = entry,
+                    None => lines.insert(s, entry),
                 }
                 changed = true;
             }
         }
+        None => {}
     }
-    if changed {
-        let eol: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\n" };
-        let mut out = lines.join(eol);
-        out.extend_from_slice(eol);
-        fs::write(&ini, out).map_err(|e| format!("{}: {e}", ini.display()))?;
+    let viewer = match section_range(&lines, b"[TVTEST]") {
+        None if on => {
+            lines.push(b"[TVTEST]".to_vec());
+            Some((lines.len(), lines.len()))
+        }
+        r => r,
+    };
+    if let Some((s, e)) = viewer {
+        let mut values: Vec<(i64, Vec<u8>)> = lines[s..e].iter().filter_map(|l| indexed(l).map(|(k, v)| (k, v.to_vec()))).collect();
+        values.sort_by_key(|v| v.0);
+        let listed = values.iter().any(|(_, v)| v.eq_ignore_ascii_case(file.as_bytes()));
+        if listed != on {
+            values.retain(|(_, v)| !v.eq_ignore_ascii_case(file.as_bytes()));
+            if on {
+                values.push((0, file.as_bytes().to_vec()));
+            }
+            let rest: Vec<Vec<u8>> = lines.drain(s..e).filter(|l| !l.trim_ascii().starts_with(b"Num=") && indexed(l).is_none()).collect();
+            let mut body = vec![format!("Num={}", values.len()).into_bytes()];
+            body.extend(values.into_iter().enumerate().map(|(i, (_, v))| [format!("{i}=").into_bytes(), v].concat()));
+            body.extend(rest);
+            lines.splice(s..s, body);
+            changed = true;
+        }
     }
-    Ok(changed)
+    changed
+}
+
+fn update_tuners(cfg: &Config, changes: &[(String, bool)]) -> Result<Vec<(String, bool)>, String> {
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ini = edcb_ini(cfg);
+    let raw = fs::read(&ini).map_err(|e| format!("{}: {e}", ini.display()))?;
+    let utf16 = raw.starts_with(&[0xFF, 0xFE]);
+    let text = if utf16 {
+        String::from_utf16_lossy(&raw[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()).into_bytes()
+    } else {
+        raw
+    };
+    let mut lines = split_lines(&text);
+    let done: Vec<(String, bool)> = changes
+        .iter()
+        .filter(|(name, on)| {
+            let file = module_path(cfg, name).file_name().unwrap_or_default().to_string_lossy().into_owned();
+            set_tuner(&mut lines, &file, *on)
+        })
+        .cloned()
+        .collect();
+    if !done.is_empty() {
+        let mut out = join_lines(&lines);
+        if utf16 {
+            out = [0xFF, 0xFE].into_iter().chain(String::from_utf8_lossy(&out).encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        }
+        let tmp = ini.with_extension("ini.tmp");
+        fs::write(&tmp, out).and_then(|_| fs::rename(&tmp, &ini)).map_err(|e| format!("{}: {e}", ini.display()))?;
+    }
+    Ok(done)
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -241,6 +310,8 @@ pub fn apply(cfg: &Config) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut ports = Vec::new();
     let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
+    let existing = registered();
+    let mut tuners: Vec<(String, bool)> = Vec::new();
     for peer in relays(cfg) {
         let name = peer.bdp_name.trim();
         if !valid_name(name) || peer.bdp_port == 0 || peer.bdp_group.trim().is_empty() {
@@ -260,21 +331,26 @@ pub fn apply(cfg: &Config) -> Vec<String> {
                 continue;
             }
         }
-        match register_tuner(cfg, name) {
-            Ok(true) => log.push(format!("{name}: EpgTimerSrv.ini にチューナー・視聴用として登録しました (EpgTimer Service の再起動後に反映されます)")),
-            Ok(false) => {}
-            Err(e) => log.push(format!("{name}: EpgTimerSrv.ini への登録に失敗しました: {e}")),
+        if !existing.iter().any(|s| same(name, s)) {
+            tuners.push((name.to_string(), true));
         }
         match register(name) {
             Ok(()) => log.push(format!("{name}: 中継を登録しました (127.0.0.1:{} → {})", peer.bdp_port, peer.bdp_url)),
             Err(e) => log.push(format!("{name}: 中継の登録に失敗しました: {e}")),
         }
     }
-    for stale in registered().into_iter().filter(|s| !names.iter().any(|n| same(n, s))) {
+    for stale in existing.into_iter().filter(|s| !names.iter().any(|n| same(n, s))) {
         match unregister(&stale) {
             Ok(()) => log.push(format!("{stale}: 中継の登録を外しました")),
             Err(e) => log.push(format!("{stale}: 中継の削除に失敗しました: {e}")),
         }
+        tuners.push((stale, false));
+    }
+    match update_tuners(cfg, &tuners) {
+        Ok(done) => log.extend(done.into_iter().map(|(name, on)| {
+            format!("{name}: EpgTimerSrv.ini のチューナー・視聴用の登録を{}しました (EpgTimer Service の再起動後に反映されます)", if on { "追加" } else { "解除" })
+        })),
+        Err(e) => log.push(format!("EpgTimerSrv.ini の更新に失敗しました: {e}")),
     }
     if log.is_empty() {
         log.push("BonDriver の設定がある取得先はありません".into());
