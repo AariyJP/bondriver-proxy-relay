@@ -123,7 +123,7 @@ fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, want: Option<u16>) -> bool {
     let on = want.is_some();
     let section = format!("[{file}]");
     let mut changed = false;
-    match section_range(&lines, section.as_bytes()) {
+    match section_range(lines, section.as_bytes()) {
         None if on => {
             let mut bondriver = false;
             let mut priority = -1;
@@ -157,7 +157,7 @@ fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, want: Option<u16>) -> bool {
         }
         None => {}
     }
-    let viewer = match section_range(&lines, b"[TVTEST]") {
+    let viewer = match section_range(lines, b"[TVTEST]") {
         None if on => {
             lines.push(b"[TVTEST]".to_vec());
             Some((lines.len(), lines.len()))
@@ -194,7 +194,7 @@ fn update_tuners(cfg: &Config, changes: &[(String, Option<u16>)]) -> Result<Vec<
     let raw = fs::read(&ini).map_err(|e| format!("{}: {e}", ini.display()))?;
     let utf16 = raw.starts_with(&[0xFF, 0xFE]);
     let text = if utf16 {
-        String::from_utf16_lossy(&raw[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()).into_bytes()
+        String::from_utf16_lossy(&raw[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()).into_bytes()
     } else {
         raw
     };
