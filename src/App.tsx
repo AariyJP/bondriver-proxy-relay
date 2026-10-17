@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 
-type Peer = { url: string; token_file: string; bdp_url: string; bdp_port: number; bdp_group: string; bdp_name: string };
+type Peer = { url: string; token_file: string; bdp_url: string; bdp_port: number; bdp_group: string; bdp_name: string; bdp_count: number };
 type Config = {
   epg_dir: string;
   listen: string;
@@ -19,6 +19,7 @@ type Config = {
   reload_addr: string;
   bondriver_dir: string;
   cloudflared: string;
+  edcb_ini: string;
 };
 
 function Field({ id, label, value, onChange, placeholder }: { id: string; label: string; value: string; onChange: (v: string) => void; placeholder?: string }) {
@@ -154,6 +155,7 @@ export default function App() {
           </div>
           <Field id="bondriver_dir" label="BonDriver フォルダー" value={cfg.bondriver_dir} onChange={(v) => set({ bondriver_dir: v })} />
           <Field id="cloudflared" label="cloudflared のパス" value={cfg.cloudflared} onChange={(v) => set({ cloudflared: v })} />
+          <Field id="edcb_ini" label="EpgTimerSrv.ini のパス" value={cfg.edcb_ini} placeholder="空欄なら自動で探します" onChange={(v) => set({ edcb_ini: v })} />
         </CardContent>
       </Card>
 
@@ -197,15 +199,16 @@ export default function App() {
                   <Trash2 />
                 </Button>
               </div>
-              <div className="grid grid-cols-[2fr_1fr_1fr_1fr] gap-2">
+              <div className="grid grid-cols-[2fr_1fr_1fr_1fr_1fr] gap-2">
                 <Input value={p.bdp_url} placeholder="チューナー: https://example.com/bdp" onChange={(e) => setPeer(i, { bdp_url: e.target.value })} />
                 <Input type="number" value={p.bdp_port || ""} placeholder="ポート" onChange={(e) => setPeer(i, { bdp_port: Number(e.target.value) || 0 })} />
                 <Input value={p.bdp_group} placeholder="グループ名" onChange={(e) => setPeer(i, { bdp_group: e.target.value })} />
                 <Input value={p.bdp_name} placeholder="名前 (Z390)" onChange={(e) => setPeer(i, { bdp_name: e.target.value })} />
+                <Input type="number" value={p.bdp_count || ""} placeholder="チューナー数" onChange={(e) => setPeer(i, { bdp_count: Number(e.target.value) || 0 })} />
               </div>
             </div>
           ))}
-          <Button variant="outline" size="sm" className="w-fit" onClick={() => set({ peers: [...cfg.peers, { url: "", token_file: "", bdp_url: "", bdp_port: 0, bdp_group: "", bdp_name: "" }] })}>
+          <Button variant="outline" size="sm" className="w-fit" onClick={() => set({ peers: [...cfg.peers, { url: "", token_file: "", bdp_url: "", bdp_port: 0, bdp_group: "", bdp_name: "", bdp_count: 0 }] })}>
             <Plus />
             取得先を追加
           </Button>

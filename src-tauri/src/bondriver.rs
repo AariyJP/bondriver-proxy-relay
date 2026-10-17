@@ -93,7 +93,10 @@ fn write_module(cfg: &Config, peer: &Peer) -> Result<String, String> {
 }
 
 fn edcb_ini(cfg: &Config) -> PathBuf {
-    if cfg!(windows) {
+    let ini = cfg.edcb_ini.trim();
+    if !ini.is_empty() {
+        PathBuf::from(ini)
+    } else if cfg!(windows) {
         Path::new(&cfg.bondriver_dir).parent().unwrap_or(Path::new("")).join("EpgTimerSrv.ini")
     } else {
         PathBuf::from("/var/local/edcb/EpgTimerSrv.ini")
@@ -116,7 +119,8 @@ fn indexed(line: &[u8]) -> Option<(i64, &[u8])> {
     Some((num(&t[..p])?, t[p + 1..].trim_ascii()))
 }
 
-fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, on: bool) -> bool {
+fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, want: Option<u16>) -> bool {
+    let on = want.is_some();
     let section = format!("[{file}]");
     let mut changed = false;
     match section_range(&lines, section.as_bytes()) {
@@ -130,15 +134,20 @@ fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, on: bool) -> bool {
                     priority = priority.max(num(v).unwrap_or(-1));
                 }
             }
-            let entry = [String::new(), section, "Count=1".into(), "GetEpg=0".into(), "EPGCount=0".into(), format!("Priority={}", priority + 1)];
+            let entry = [String::new(), section, format!("Count={}", want.unwrap_or(0).max(1)), "GetEpg=0".into(), "EPGCount=0".into(), format!("Priority={}", priority + 1)];
             lines.extend(entry.map(String::into_bytes));
             changed = true;
         }
         Some((s, e)) => {
             let at = (s..e).find_map(|i| lines[i].trim_ascii().strip_prefix(b"Count=").map(|v| (i, num(v))));
             let count = at.and_then(|(_, n)| n).unwrap_or(0);
-            if (count > 0) != on {
-                let entry = format!("Count={}", on as u8).into_bytes();
+            let target = match want {
+                None => 0,
+                Some(0) => count.max(1),
+                Some(n) => n.into(),
+            };
+            if count != target {
+                let entry = format!("Count={target}").into_bytes();
                 match at {
                     Some((i, _)) => lines[i] = entry,
                     None => lines.insert(s, entry),
@@ -177,7 +186,7 @@ fn set_tuner(lines: &mut Vec<Vec<u8>>, file: &str, on: bool) -> bool {
     changed
 }
 
-fn update_tuners(cfg: &Config, changes: &[(String, bool)]) -> Result<Vec<(String, bool)>, String> {
+fn update_tuners(cfg: &Config, changes: &[(String, Option<u16>)]) -> Result<Vec<(String, bool)>, String> {
     if changes.is_empty() {
         return Ok(Vec::new());
     }
@@ -191,9 +200,9 @@ fn update_tuners(cfg: &Config, changes: &[(String, bool)]) -> Result<Vec<(String
     };
     let mut lines = split_lines(&text);
     let mut done = Vec::new();
-    for (name, on) in changes {
-        if set_tuner(&mut lines, &module_file(name), *on) {
-            done.push((name.clone(), *on));
+    for (name, want) in changes {
+        if set_tuner(&mut lines, &module_file(name), *want) {
+            done.push((name.clone(), want.is_some()));
         }
     }
     if !done.is_empty() {
@@ -314,7 +323,7 @@ pub fn apply(cfg: &Config) -> Vec<String> {
     let mut ports = Vec::new();
     let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
     let existing = registered();
-    let mut tuners: Vec<(String, bool)> = Vec::new();
+    let mut tuners: Vec<(String, Option<u16>)> = Vec::new();
     for peer in relays(cfg) {
         let name = peer.bdp_name.trim();
         if !valid_name(name) || peer.bdp_port == 0 || peer.bdp_group.trim().is_empty() {
@@ -334,8 +343,8 @@ pub fn apply(cfg: &Config) -> Vec<String> {
                 continue;
             }
         }
-        if !existing.iter().any(|s| same(name, s)) {
-            tuners.push((name.to_string(), true));
+        if peer.bdp_count > 0 || !existing.iter().any(|s| same(name, s)) {
+            tuners.push((name.to_string(), Some(peer.bdp_count)));
         }
         match register(name) {
             Ok(()) => log.push(format!("{name}: 中継を登録しました (127.0.0.1:{} → {})", peer.bdp_port, peer.bdp_url)),
@@ -347,7 +356,7 @@ pub fn apply(cfg: &Config) -> Vec<String> {
             Ok(()) => log.push(format!("{stale}: 中継の登録を外しました")),
             Err(e) => log.push(format!("{stale}: 中継の削除に失敗しました: {e}")),
         }
-        tuners.push((stale, false));
+        tuners.push((stale, None));
     }
     match update_tuners(cfg, &tuners) {
         Ok(done) => log.extend(done.into_iter().map(|(name, on)| {

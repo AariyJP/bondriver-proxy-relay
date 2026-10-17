@@ -16,6 +16,7 @@ pub struct Peer {
     pub bdp_port: u16,
     pub bdp_group: String,
     pub bdp_name: String,
+    pub bdp_count: u16,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -29,6 +30,7 @@ pub struct Config {
     pub reload_addr: String,
     pub bondriver_dir: String,
     pub cloudflared: String,
+    pub edcb_ini: String,
 }
 
 impl Default for Config {
@@ -54,6 +56,7 @@ impl Default for Config {
             } else {
                 "/usr/bin/cloudflared".into()
             },
+            edcb_ini: String::new(),
         }
     }
 }
