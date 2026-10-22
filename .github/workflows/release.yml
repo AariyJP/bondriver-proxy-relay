@@ -1,0 +1,80 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.release.outputs.id }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - id: release
+        run: |
+          now=$(date +%s)
+          tag=$(TZ=Asia/Tokyo date -d @$now +%Y.%m.%d)
+          echo "version=$(TZ=Asia/Tokyo date -d @$now +%Y.%-m.%-d)" >> "$GITHUB_OUTPUT"
+          echo "id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$tag" -f name="$tag" -f target_commitish="$GITHUB_SHA" -F draft=true -F generate_release_notes=true --jq .id)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: create
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis
+          - os: ubuntu-latest
+            bundles: deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libwebkit2gtk-4.1-dev
+          version: 1.0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+          cache-all-crates: true
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          releaseId: ${{ needs.create.outputs.id }}
+          uploadPlainBinary: true
+          releaseAssetNamePattern: '[mainBinaryName]_[platform]_[arch][setup][ext]'
+          args: --bundles ${{ matrix.bundles }} --config '{"version":"${{ needs.create.outputs.version }}"}'
+
+  publish:
+    needs: [create, build]
+    runs-on: ubuntu-slim
+    steps:
+      - run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/${{ needs.create.outputs.id }}" -F draft=false
+        env:
+          GH_TOKEN: ${{ github.token }}
