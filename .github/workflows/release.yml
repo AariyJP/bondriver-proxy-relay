@@ -68,6 +68,7 @@ jobs:
         with:
           releaseId: ${{ needs.create.outputs.id }}
           uploadPlainBinary: true
+          releaseAssetNamePattern: '[mainBinaryName]_[platform]_[arch][setup][ext]'
           args: --bundles ${{ matrix.bundles }} --config '{"version":"${{ needs.create.outputs.version }}"}'
 
   publish:
