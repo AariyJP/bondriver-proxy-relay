@@ -308,7 +308,7 @@ fn register(name: &str, setting: &Path) -> Result<(), String> {
         esc(&exe()?),
         esc(&args)
     );
-    let file = std::env::temp_dir().join(format!("bondriverproxyrelay-relay-{name}.xml"));
+    let file = std::env::temp_dir().join(format!("bondriver-proxy-relay-{name}.xml"));
     fs::write(&file, utf16le(&xml)).map_err(|e| e.to_string())?;
     let task = format!("{TASK_PREFIX}{name}");
     let result = run("schtasks", &["/Create", "/TN", &task, "/XML", &file.display().to_string(), "/F"]);
@@ -343,7 +343,7 @@ const UNIT_DIR: &str = "/etc/systemd/system";
 
 #[cfg(not(windows))]
 fn unit(name: &str) -> String {
-    format!("bondriverproxyrelay-relay-{name}.service")
+    format!("bondriver-proxy-relay-{name}.service")
 }
 
 #[cfg(not(windows))]
@@ -364,7 +364,7 @@ fn register(name: &str, setting: &Path) -> Result<(), String> {
 fn registered() -> Vec<String> {
     let Ok(dir) = fs::read_dir(UNIT_DIR) else { return Vec::new() };
     dir.filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter_map(|n| n.strip_prefix("bondriverproxyrelay-relay-")?.strip_suffix(".service").map(str::to_string))
+        .filter_map(|n| n.strip_prefix("bondriver-proxy-relay-")?.strip_suffix(".service").map(str::to_string))
         .collect()
 }
 
@@ -458,7 +458,7 @@ pub fn relay(setting: &str) -> Result<(), String> {
 }
 
 fn temp_file(ext: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("bondriverproxyrelay-apply.{ext}"))
+    std::env::temp_dir().join(format!("bondriver-proxy-relay-apply.{ext}"))
 }
 
 pub fn apply_elevated(cfg: &Config) -> Result<Vec<String>, String> {
